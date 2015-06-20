@@ -7,24 +7,26 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
-	bosherr "github.com/cloudfoundry/bosh-agent/errors"
 	boshdpresolv "github.com/cloudfoundry/bosh-agent/infrastructure/devicepathresolver"
-	boshlog "github.com/cloudfoundry/bosh-agent/logger"
-	boshcmd "github.com/cloudfoundry/bosh-agent/platform/commands"
+	boshcert "github.com/cloudfoundry/bosh-agent/platform/cert"
 	boshdevutil "github.com/cloudfoundry/bosh-agent/platform/deviceutil"
 	boshdisk "github.com/cloudfoundry/bosh-agent/platform/disk"
 	boshnet "github.com/cloudfoundry/bosh-agent/platform/net"
 	boshstats "github.com/cloudfoundry/bosh-agent/platform/stats"
 	boshvitals "github.com/cloudfoundry/bosh-agent/platform/vitals"
-	boshretry "github.com/cloudfoundry/bosh-agent/retrystrategy"
 	boshsettings "github.com/cloudfoundry/bosh-agent/settings"
 	boshdir "github.com/cloudfoundry/bosh-agent/settings/directories"
 	boshdirs "github.com/cloudfoundry/bosh-agent/settings/directories"
-	boshsys "github.com/cloudfoundry/bosh-agent/system"
+	bosherr "github.com/cloudfoundry/bosh-utils/errors"
+	boshcmd "github.com/cloudfoundry/bosh-utils/fileutil"
+	boshlog "github.com/cloudfoundry/bosh-utils/logger"
+	boshretry "github.com/cloudfoundry/bosh-utils/retrystrategy"
+	boshsys "github.com/cloudfoundry/bosh-utils/system"
 )
 
 const (
@@ -75,6 +77,7 @@ type linux struct {
 	cdutil                 boshdevutil.DeviceUtil
 	diskManager            boshdisk.Manager
 	netManager             boshnet.Manager
+	certManager            boshcert.Manager
 	monitRetryStrategy     boshretry.RetryStrategy
 	devicePathResolver     boshdpresolv.DevicePathResolver
 	diskScanDuration       time.Duration
@@ -94,6 +97,7 @@ func NewLinuxPlatform(
 	cdutil boshdevutil.DeviceUtil,
 	diskManager boshdisk.Manager,
 	netManager boshnet.Manager,
+	certManager boshcert.Manager,
 	monitRetryStrategy boshretry.RetryStrategy,
 	devicePathResolver boshdpresolv.DevicePathResolver,
 	diskScanDuration time.Duration,
@@ -112,6 +116,7 @@ func NewLinuxPlatform(
 		cdutil:                 cdutil,
 		diskManager:            diskManager,
 		netManager:             netManager,
+		certManager:            certManager,
 		monitRetryStrategy:     monitRetryStrategy,
 		devicePathResolver:     devicePathResolver,
 		diskScanDuration:       diskScanDuration,
@@ -170,6 +175,10 @@ func (p linux) SetupNetworking(networks boshsettings.Networks) (err error) {
 
 func (p linux) GetConfiguredNetworkInterfaces() ([]string, error) {
 	return p.netManager.GetConfiguredNetworkInterfaces()
+}
+
+func (p linux) GetCertManager() boshcert.Manager {
+	return p.certManager
 }
 
 func (p linux) SetupRuntimeConfiguration() (err error) {
@@ -800,41 +809,50 @@ func (p linux) calculateEphemeralDiskPartitionSizes(diskSizeInBytes uint64) (uin
 	return swapSizeInBytes, linuxSizeInBytes, nil
 }
 
-func (p linux) findRootDevicePath() (string, error) {
+func (p linux) findRootDevicePath() (string, uint8, error) {
 	mounts, err := p.diskManager.GetMountsSearcher().SearchMounts()
 
 	if err != nil {
-		return "", bosherr.WrapError(err, "Searching mounts")
+		return "", 0, bosherr.WrapError(err, "Searching mounts")
 	}
+
+	var maxDevNum uint8
+	var devPath string
+	validPartition := regexp.MustCompile(`^/dev/[a-z]+\d$`)
 
 	for _, mount := range mounts {
+		stdout, _, _, err := p.cmdRunner.RunCommand("readlink", "-f", mount.PartitionPath)
+		if err != nil {
+			return "", 0, bosherr.WrapError(err, "Shelling out to readlink")
+		}
+		partition := strings.Trim(stdout, "\n")
+		p.logger.Debug(logTag, "Symlink is: `%s'", partition)
+		if validPartition.MatchString(partition) {
+			devNum := partition[len(partition)-1] - 48
+			if devNum > maxDevNum {
+				maxDevNum = devNum
+			}
+		}
+
 		if mount.MountPoint == "/" && strings.HasPrefix(mount.PartitionPath, "/dev/") {
 			p.logger.Debug(logTag, "Found root partition: `%s'", mount.PartitionPath)
-
-			stdout, _, _, err := p.cmdRunner.RunCommand("readlink", "-f", mount.PartitionPath)
-			if err != nil {
-				return "", bosherr.WrapError(err, "Shelling out to readlink")
+			if !validPartition.MatchString(partition) {
+				return "", 0, bosherr.Error("Root partition has an invalid name")
 			}
-			rootPartition := strings.Trim(stdout, "\n")
-			p.logger.Debug(logTag, "Symlink is: `%s'", rootPartition)
-
-			validRootPartition := regexp.MustCompile(`^/dev/[a-z]+1$`)
-			if !validRootPartition.MatchString(rootPartition) {
-				return "", bosherr.Error("Root partition is not the first partition")
-			}
-
-			return strings.Trim(rootPartition, "1"), nil
+			devPath = partition[:len(partition)-1]
 		}
 	}
-
-	return "", bosherr.Error("Getting root partition device")
+	if devPath != "" {
+		return devPath, maxDevNum, nil
+	}
+	return "", 0, bosherr.Error("Getting root partition device")
 }
 
 func (p linux) createEphemeralPartitionsOnRootDevice() (string, string, error) {
 	p.logger.Info(logTag, "Creating swap & ephemeral partitions on root disk...")
 	p.logger.Debug(logTag, "Determining root device")
 
-	rootDevicePath, err := p.findRootDevicePath()
+	rootDevicePath, rootDeviceNum, err := p.findRootDevicePath()
 	if err != nil {
 		return "", "", bosherr.WrapError(err, "Finding root partition device")
 	}
@@ -870,8 +888,8 @@ func (p linux) createEphemeralPartitionsOnRootDevice() (string, string, error) {
 		return "", "", bosherr.WrapErrorf(err, "Partitioning root device `%s'", rootDevicePath)
 	}
 
-	swapPartitionPath := rootDevicePath + "2"
-	dataPartitionPath := rootDevicePath + "3"
+	swapPartitionPath := rootDevicePath + strconv.Itoa(int(rootDeviceNum+1))
+	dataPartitionPath := rootDevicePath + strconv.Itoa(int(rootDeviceNum+2))
 	return swapPartitionPath, dataPartitionPath, nil
 }
 
